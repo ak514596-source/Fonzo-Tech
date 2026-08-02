@@ -1,32 +1,33 @@
 import type { Product, InsertProduct, UpdateProduct, Order, InsertOrder, UpdateOrder } from "@shared/schema";
-import { createClient } from "@supabase/supabase-js";
+import { neon } from "@neondatabase/serverless";
 import { randomBytes } from "node:crypto";
 
 // ---------------------------------------------------------------------------
-// Shared Supabase database.
+// Shared Neon Postgres database.
 //
 // Both the customer website and the team portal read and write THIS database,
 // which is what keeps them in sync: there is only ever one product list and
-// one order list. The service-role key is used because this code runs only on
-// the server — it must never be shipped to the browser.
+// one order list.
+//
+// The connection string comes from DATABASE_URL, which Vercel's Neon
+// integration injects automatically (POSTGRES_URL is accepted as a fallback).
+// Tables are created and seeded automatically on first use — no manual SQL
+// setup step is required.
 // ---------------------------------------------------------------------------
 
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // staff stay logged in for 7 days
 const OTP_TTL_MS = 10 * 60 * 1000; // login codes are valid for 10 minutes
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL;
 
-if (!supabaseUrl || !supabaseKey) {
+if (!DATABASE_URL) {
   throw new Error(
-    "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY " +
-      "in your environment (see .env.example and SUPABASE_SETUP.md).",
+    "Database is not configured. Set DATABASE_URL (Vercel: add the Neon " +
+      "integration under Storage, or set it manually — see DATABASE_SETUP.md).",
   );
 }
 
-export const supabase = createClient(supabaseUrl, supabaseKey, {
-  auth: { persistSession: false },
-});
+const sql = neon(DATABASE_URL);
 
 // Emails allowed to sign in to the team portal. Override with the TEAM_EMAILS
 // environment variable (comma-separated) without touching the code.
@@ -38,8 +39,147 @@ const TEAM_ALLOW_LIST = (
   .map((email) => email.trim().toLowerCase())
   .filter(Boolean);
 
-function fail(message: string): never {
-  throw new Error(message);
+// ---------------------------------------------------------------------------
+// Schema bootstrap — runs once per process, guarded by a promise.
+// ---------------------------------------------------------------------------
+
+const SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS products (
+    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title text NOT NULL,
+    category text NOT NULL,
+    brand text NOT NULL,
+    model text NOT NULL,
+    condition text NOT NULL,
+    storage text NOT NULL DEFAULT '',
+    color text NOT NULL DEFAULT '',
+    price real NOT NULL,
+    "originalPrice" real,
+    stock integer NOT NULL DEFAULT 0,
+    rating real NOT NULL DEFAULT 4.8,
+    "reviewCount" integer NOT NULL DEFAULT 0,
+    "shortDescription" text NOT NULL DEFAULT '',
+    description text NOT NULL DEFAULT '',
+    featured boolean NOT NULL DEFAULT false,
+    "imageUrl" text NOT NULL DEFAULT '',
+    "visualKey" text NOT NULL DEFAULT 'phone'
+  );
+
+  CREATE TABLE IF NOT EXISTS orders (
+    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    "orderNumber" text NOT NULL,
+    "customerName" text NOT NULL,
+    "customerEmail" text NOT NULL,
+    "customerPhone" text NOT NULL DEFAULT '',
+    "deliveryMethod" text NOT NULL,
+    address text NOT NULL DEFAULT '',
+    "itemsJson" text NOT NULL,
+    subtotal real NOT NULL,
+    shipping real NOT NULL,
+    total real NOT NULL,
+    "paymentStatus" text NOT NULL DEFAULT 'Payment pending',
+    "orderStatus" text NOT NULL DEFAULT 'New',
+    "paymentProvider" text NOT NULL DEFAULT 'Not connected',
+    "createdAt" text NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE IF NOT EXISTS users (
+    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name text NOT NULL DEFAULT '',
+    role text NOT NULL DEFAULT 'customer',
+    "createdAt" text NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE IF NOT EXISTS otp_codes (
+    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL,
+    role text NOT NULL,
+    code text NOT NULL,
+    "expiresAt" text NOT NULL,
+    used boolean NOT NULL DEFAULT false,
+    "createdAt" text NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token text PRIMARY KEY,
+    "userId" integer NOT NULL,
+    email text NOT NULL,
+    role text NOT NULL,
+    "createdAt" text NOT NULL DEFAULT '',
+    "expiresAt" text NOT NULL
+  );
+`;
+
+let readyPromise: Promise<void> | null = null;
+
+async function ensureReady(): Promise<void> {
+  if (!readyPromise) {
+    readyPromise = (async () => {
+      // Neon's HTTP driver runs one statement per call — split the bootstrap.
+      const statements = SCHEMA_SQL.split(/;\s*(?=CREATE)/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const statement of statements) {
+        await sql.query(statement.endsWith(";") ? statement : `${statement};`);
+      }
+      await seedIfEmptyInternal();
+    })().catch((err) => {
+      readyPromise = null; // allow retry on next request
+      throw err;
+    });
+  }
+  return readyPromise;
+}
+
+// Columns staff are allowed to write on products. Keys are the API/TS field
+// names; values are the quoted SQL identifiers. Anything not listed is ignored,
+// which keeps dynamic UPDATEs safe.
+const PRODUCT_COLUMNS: Record<string, string> = {
+  title: '"title"',
+  category: '"category"',
+  brand: '"brand"',
+  model: '"model"',
+  condition: '"condition"',
+  storage: '"storage"',
+  color: '"color"',
+  price: '"price"',
+  originalPrice: '"originalPrice"',
+  stock: '"stock"',
+  rating: '"rating"',
+  reviewCount: '"reviewCount"',
+  shortDescription: '"shortDescription"',
+  description: '"description"',
+  featured: '"featured"',
+  imageUrl: '"imageUrl"',
+  visualKey: '"visualKey"',
+};
+
+const ORDER_UPDATE_COLUMNS: Record<string, string> = {
+  paymentStatus: '"paymentStatus"',
+  orderStatus: '"orderStatus"',
+};
+
+function buildInsert(table: string, columns: Record<string, string>, input: Record<string, unknown>) {
+  const keys = Object.keys(input).filter((k) => columns[k] !== undefined && input[k] !== undefined);
+  const identifiers = keys.map((k) => columns[k]).join(", ");
+  const placeholders = keys.map((_, i) => `$${i + 1}`).join(", ");
+  const values = keys.map((k) => input[k]);
+  return {
+    text: `INSERT INTO ${table} (${identifiers}) VALUES (${placeholders}) RETURNING *`,
+    values,
+  };
+}
+
+function buildUpdate(table: string, columns: Record<string, string>, input: Record<string, unknown>, id: number) {
+  const keys = Object.keys(input).filter((k) => columns[k] !== undefined && input[k] !== undefined);
+  if (keys.length === 0) return null;
+  const sets = keys.map((k, i) => `${columns[k]} = $${i + 1}`).join(", ");
+  const values = keys.map((k) => input[k]);
+  return {
+    text: `UPDATE ${table} SET ${sets} WHERE id = $${keys.length + 1} RETURNING *`,
+    values: [...values, id],
+  };
 }
 
 export interface IStorage {
@@ -62,106 +202,89 @@ export interface IStorage {
 
 export class DatabaseStorage implements IStorage {
   async listProducts(): Promise<Product[]> {
-    const { data, error } = await supabase
-      .from("products")
-      .select("*")
-      .order("id", { ascending: true });
-    if (error) fail(error.message);
-    return (data ?? []) as Product[];
+    await ensureReady();
+    const rows = await sql`SELECT * FROM products ORDER BY id ASC`;
+    return rows as Product[];
   }
 
   async getProduct(id: number): Promise<Product | undefined> {
-    const { data, error } = await supabase
-      .from("products")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-    if (error) fail(error.message);
-    return (data ?? undefined) as Product | undefined;
+    await ensureReady();
+    const rows = await sql`SELECT * FROM products WHERE id = ${id}`;
+    return (rows[0] as Product) ?? undefined;
   }
 
   async createProduct(input: InsertProduct): Promise<Product> {
-    const { data, error } = await supabase
-      .from("products")
-      .insert(input)
-      .select()
-      .single();
-    if (error) fail(error.message);
-    return data as Product;
+    await ensureReady();
+    const q = buildInsert("products", PRODUCT_COLUMNS, input as Record<string, unknown>);
+    const rows = await sql.query(q.text, q.values);
+    return rows[0] as Product;
   }
 
   async updateProduct(id: number, input: UpdateProduct): Promise<Product | undefined> {
-    const existing = await this.getProduct(id);
-    if (!existing) return undefined;
-    const { data, error } = await supabase
-      .from("products")
-      .update(input)
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) fail(error.message);
-    return data as Product;
+    await ensureReady();
+    const q = buildUpdate("products", PRODUCT_COLUMNS, input as Record<string, unknown>, id);
+    if (!q) return this.getProduct(id);
+    const rows = await sql.query(q.text, q.values);
+    return (rows[0] as Product) ?? undefined;
   }
 
   async deleteProduct(id: number): Promise<boolean> {
-    const existing = await this.getProduct(id);
-    if (!existing) return false;
-    const { error } = await supabase.from("products").delete().eq("id", id);
-    if (error) fail(error.message);
-    return true;
+    await ensureReady();
+    const rows = await sql`DELETE FROM products WHERE id = ${id} RETURNING id`;
+    return rows.length > 0;
   }
 
   async countProducts(): Promise<number> {
-    const { count, error } = await supabase
-      .from("products")
-      .select("*", { count: "exact", head: true });
-    if (error) fail(error.message);
-    return count ?? 0;
+    const rows = await sql`SELECT count(*)::int AS c FROM products`;
+    return Number(rows[0]?.c ?? 0);
   }
 
   async listOrders(): Promise<Order[]> {
-    const { data, error } = await supabase
-      .from("orders")
-      .select("*")
-      .order("id", { ascending: false });
-    if (error) fail(error.message);
-    return (data ?? []) as Order[];
+    await ensureReady();
+    const rows = await sql`SELECT * FROM orders ORDER BY id DESC`;
+    return rows as Order[];
   }
 
   async getOrder(id: number): Promise<Order | undefined> {
-    const { data, error } = await supabase
-      .from("orders")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-    if (error) fail(error.message);
-    return (data ?? undefined) as Order | undefined;
+    await ensureReady();
+    const rows = await sql`SELECT * FROM orders WHERE id = ${id}`;
+    return (rows[0] as Order) ?? undefined;
   }
 
   async createOrder(input: InsertOrder): Promise<Order> {
-    const { data, error } = await supabase
-      .from("orders")
-      .insert({ ...input, createdAt: new Date().toISOString() })
-      .select()
-      .single();
-    if (error) fail(error.message);
-    return data as Order;
+    await ensureReady();
+    const record = { ...input, createdAt: new Date().toISOString() } as Record<string, unknown>;
+    const ORDER_COLUMNS: Record<string, string> = {
+      orderNumber: '"orderNumber"',
+      customerName: '"customerName"',
+      customerEmail: '"customerEmail"',
+      customerPhone: '"customerPhone"',
+      deliveryMethod: '"deliveryMethod"',
+      address: '"address"',
+      itemsJson: '"itemsJson"',
+      subtotal: '"subtotal"',
+      shipping: '"shipping"',
+      total: '"total"',
+      paymentStatus: '"paymentStatus"',
+      orderStatus: '"orderStatus"',
+      paymentProvider: '"paymentProvider"',
+      createdAt: '"createdAt"',
+    };
+    const q = buildInsert("orders", ORDER_COLUMNS, record);
+    const rows = await sql.query(q.text, q.values);
+    return rows[0] as Order;
   }
 
   async updateOrder(id: number, input: UpdateOrder): Promise<Order | undefined> {
-    const existing = await this.getOrder(id);
-    if (!existing) return undefined;
-    const { data, error } = await supabase
-      .from("orders")
-      .update(input)
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) fail(error.message);
-    return data as Order;
+    await ensureReady();
+    const q = buildUpdate("orders", ORDER_UPDATE_COLUMNS, input as Record<string, unknown>, id);
+    if (!q) return this.getOrder(id);
+    const rows = await sql.query(q.text, q.values);
+    return (rows[0] as Order) ?? undefined;
   }
 
   async requestOtp(input: { email: string; name?: string; role: string; mode: string }) {
+    await ensureReady();
     const email = input.email.trim().toLowerCase();
     if (input.role === "team" && !TEAM_ALLOW_LIST.includes(email)) {
       throw new Error("This email is not allowed for team portal access.");
@@ -169,105 +292,83 @@ export class DatabaseStorage implements IStorage {
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
-    const { error } = await supabase.from("otp_codes").insert({
-      email,
-      role: input.role,
-      code: otp,
-      expiresAt,
-      used: false,
-      createdAt: new Date().toISOString(),
-    });
-    if (error) fail(error.message);
+    await sql`
+      INSERT INTO otp_codes (email, role, code, "expiresAt", used, "createdAt")
+      VALUES (${email}, ${input.role}, ${otp}, ${expiresAt}, false, ${new Date().toISOString()})
+    `;
 
     if (input.mode === "signup") {
-      await supabase.from("users").upsert(
-        { email, name: input.name || "", role: input.role, createdAt: new Date().toISOString() },
-        { onConflict: "email", ignoreDuplicates: true },
-      );
+      await sql`
+        INSERT INTO users (email, name, role, "createdAt")
+        VALUES (${email}, ${input.name || ""}, ${input.role}, ${new Date().toISOString()})
+        ON CONFLICT (email) DO NOTHING
+      `;
     }
 
     return { email, role: input.role, otp, expiresAt };
   }
 
   async verifyOtp(input: { email: string; otp: string; role: string; name?: string }) {
+    await ensureReady();
     const email = input.email.trim().toLowerCase();
-    const { data: rows, error } = await supabase
-      .from("otp_codes")
-      .select("*")
-      .eq("email", email)
-      .eq("role", input.role)
-      .eq("code", input.otp)
-      .eq("used", false)
-      .order("id", { ascending: false })
-      .limit(1);
-    if (error) fail(error.message);
-
-    const row = rows?.[0];
+    const rows = await sql`
+      SELECT * FROM otp_codes
+      WHERE email = ${email} AND role = ${input.role} AND code = ${input.otp} AND used = false
+      ORDER BY id DESC LIMIT 1
+    `;
+    const row = rows[0] as { id: number; expiresAt: string } | undefined;
     if (!row || new Date(row.expiresAt).getTime() < Date.now()) return undefined;
-    await supabase.from("otp_codes").update({ used: true }).eq("id", row.id);
+    await sql`UPDATE otp_codes SET used = true WHERE id = ${row.id}`;
 
-    await supabase.from("users").upsert(
-      { email, name: input.name || "", role: input.role, createdAt: new Date().toISOString() },
-      { onConflict: "email", ignoreDuplicates: true },
-    );
+    await sql`
+      INSERT INTO users (email, name, role, "createdAt")
+      VALUES (${email}, ${input.name || ""}, ${input.role}, ${new Date().toISOString()})
+      ON CONFLICT (email) DO NOTHING
+    `;
     if (input.name) {
-      await supabase.from("users").update({ name: input.name }).eq("email", email);
+      await sql`UPDATE users SET name = ${input.name} WHERE email = ${email}`;
     }
 
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("id, email, name, role")
-      .eq("email", email)
-      .single();
-    if (userError) fail(userError.message);
-    return user as { id: number; email: string; name: string; role: string };
+    const userRows = await sql`SELECT id, email, name, role FROM users WHERE email = ${email}`;
+    return userRows[0] as { id: number; email: string; name: string; role: string } | undefined;
   }
 
   async createSession(user: { id: number; email: string; role: string }): Promise<string> {
+    await ensureReady();
     const token = randomBytes(32).toString("hex");
     const now = new Date();
-    const { error } = await supabase.from("sessions").insert({
-      token,
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      createdAt: now.toISOString(),
-      expiresAt: new Date(now.getTime() + SESSION_TTL_MS).toISOString(),
-    });
-    if (error) fail(error.message);
+    await sql`
+      INSERT INTO sessions (token, "userId", email, role, "createdAt", "expiresAt")
+      VALUES (${token}, ${user.id}, ${user.email}, ${user.role},
+              ${now.toISOString()}, ${new Date(now.getTime() + SESSION_TTL_MS).toISOString()})
+    `;
     return token;
   }
 
   async getSession(token: string): Promise<{ userId: number; email: string; role: string } | undefined> {
     if (!token) return undefined;
-    const { data, error } = await supabase
-      .from("sessions")
-      .select("*")
-      .eq("token", token)
-      .maybeSingle();
-    if (error) fail(error.message);
-    if (!data) return undefined;
-    if (new Date(data.expiresAt).getTime() < Date.now()) {
-      await supabase.from("sessions").delete().eq("token", token);
+    await ensureReady();
+    const rows = await sql`SELECT * FROM sessions WHERE token = ${token}`;
+    const row = rows[0] as { userId: number; email: string; role: string; expiresAt: string } | undefined;
+    if (!row) return undefined;
+    if (new Date(row.expiresAt).getTime() < Date.now()) {
+      await sql`DELETE FROM sessions WHERE token = ${token}`;
       return undefined;
     }
-    return { userId: data.userId, email: data.email, role: data.role };
+    return { userId: row.userId, email: row.email, role: row.role };
   }
 
   async deleteSession(token: string): Promise<void> {
     if (!token) return;
-    await supabase.from("sessions").delete().eq("token", token);
+    await ensureReady();
+    await sql`DELETE FROM sessions WHERE token = ${token}`;
   }
 }
 
 export const storage = new DatabaseStorage();
 
 // ---------------------------------------------------------------------------
-// Seed sample tech retail data.
-//
-// The supabase-setup.sql script already seeds the catalogue, so this normally
-// does nothing. It stays as a safety net: if the products table is somehow
-// empty on boot, the starter catalogue is inserted.
+// Seed sample tech retail data on first boot (runs inside ensureReady).
 // ---------------------------------------------------------------------------
 const SEED: InsertProduct[] = [
   {
@@ -536,11 +637,22 @@ const SEED: InsertProduct[] = [
   },
 ];
 
-export async function seedIfEmpty() {
-  const count = await storage.countProducts();
-  if (count > 0) return;
+async function seedIfEmptyInternal() {
+  const rows = await sql`SELECT count(*)::int AS c FROM products`;
+  if (Number(rows[0]?.c ?? 0) > 0) return;
   for (const item of SEED) {
-    await storage.createProduct(item);
+    const q = buildInsert("products", PRODUCT_COLUMNS, item as Record<string, unknown>);
+    await sql.query(q.text, q.values);
   }
   console.log(`[seed] inserted ${SEED.length} products`);
+}
+
+// Kept for compatibility with routes.ts — schema bootstrap and seeding now
+// happen lazily inside ensureReady(), so this only warms things up.
+export async function seedIfEmpty() {
+  try {
+    await ensureReady();
+  } catch (err) {
+    console.error("[db] bootstrap failed:", (err as Error).message);
+  }
 }

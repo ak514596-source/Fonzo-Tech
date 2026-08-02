@@ -29,6 +29,7 @@ export default function HomePage() {
   return (
     <div>
       <Hero />
+      <StatsBand />
       <CategoryStrip />
       <FeaturedSection products={featured} loading={isLoading} />
       <ValueProps />
@@ -36,6 +37,27 @@ export default function HomePage() {
       <ReviewsBand />
       <PromoBand />
     </div>
+  );
+}
+
+function StatsBand() {
+  const stats = [
+    { value: "12,000+", label: "verified reviews" },
+    { value: "4.9 / 5", label: "average rating" },
+    { value: "30-point", label: "engineer inspection" },
+    { value: "12 months", label: "warranty included" },
+  ];
+  return (
+    <section className="border-b border-border bg-secondary/30" data-testid="section-stats">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-5 grid grid-cols-2 sm:grid-cols-4 gap-4">
+        {stats.map((s) => (
+          <div key={s.label} className="text-center sm:text-left sm:flex sm:items-baseline sm:gap-2">
+            <p className="font-display text-lg sm:text-xl font-bold tabular-nums text-brand-accent">{s.value}</p>
+            <p className="text-xs text-muted-foreground">{s.label}</p>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -114,15 +136,16 @@ function Hero() {
     <section className="relative overflow-hidden border-b border-border" data-testid="section-hero">
       <div className="absolute inset-0 bg-grid opacity-30 mask-fade-bottom pointer-events-none" />
       <div className="absolute -top-40 -right-40 h-[500px] w-[500px] rounded-full bg-brand-accent/15 blur-3xl pointer-events-none" />
+      <div className="absolute -bottom-32 -left-32 h-[400px] w-[400px] rounded-full bg-brand-accent/10 blur-3xl pointer-events-none" />
       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-12 pb-16 lg:pt-20 lg:pb-24 grid lg:grid-cols-12 gap-10 items-center relative">
-        <div className="lg:col-span-7 space-y-6">
-          <div className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium" data-testid="badge-hero">
+        <div className="lg:col-span-7 space-y-6 animate-fade-up">
+          <div className="inline-flex items-center gap-2 rounded-full border border-brand-accent/30 bg-brand-accent/5 px-3 py-1 text-xs font-medium" data-testid="badge-hero">
             <Sparkles className="h-3.5 w-3.5 text-brand-accent" />
             <span>Engineer-verified · 12-month warranty</span>
           </div>
           <h1 className="font-display text-4xl sm:text-5xl lg:text-6xl font-bold tracking-tight leading-[1.05]">
             Premium tech.<br />
-            <span className="text-muted-foreground">Without the premium.</span>
+            <span className="text-gradient-accent">Without the premium.</span>
           </h1>
           <p className="text-base sm:text-lg text-muted-foreground max-w-xl leading-relaxed">
             Fonzo Tech sells verified iPhones, Android phones, MacBooks, iPads,
@@ -158,15 +181,15 @@ function Hero() {
         </div>
 
         {/* Hero visual stack */}
-        <div className="lg:col-span-5 relative">
+        <div className="lg:col-span-5 relative animate-fade-up-slow">
           <div className="grid grid-cols-2 gap-3 max-w-md mx-auto">
-            <div className="rotate-[-3deg]">
+            <div className="rotate-[-3deg] animate-float">
               <ProductVisual
                 product={{ visualKey: "phone", category: "iPhone", color: "Natural Titanium", title: "iPhone" }}
                 ratio="tall"
               />
             </div>
-            <div className="space-y-3 mt-8">
+            <div className="space-y-3 mt-8 animate-float-delayed">
               <ProductVisual
                 product={{ visualKey: "vr", category: "VR", color: "White", title: "Quest 3" }}
               />
@@ -203,12 +226,14 @@ function CategoryStrip() {
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
         {PRODUCT_CATEGORIES.map((cat) => (
           <Link key={cat} href={`/shop/${cat}`} data-testid={`tile-category-${cat.toLowerCase()}`}>
-            <div className="group rounded-xl border border-card-border bg-card hover-elevate cursor-pointer flex flex-col aspect-[4/5] overflow-hidden">
+            <div className="group rounded-xl border border-card-border bg-card hover-elevate cursor-pointer flex flex-col aspect-[4/5] overflow-hidden transition-colors hover:border-brand-accent/40">
               <div className="flex-1 flex items-center justify-center p-4 bg-gradient-to-br from-secondary/40 to-muted/40">
-                <CategoryIcon kind={visualForCategory(cat)} />
+                <div className="transition-transform duration-300 group-hover:scale-110 group-hover:text-brand-accent">
+                  <CategoryIcon kind={visualForCategory(cat)} />
+                </div>
               </div>
               <div className="px-3 py-2.5 border-t border-border text-center">
-                <span className="text-sm font-semibold">{cat}</span>
+                <span className="text-sm font-semibold group-hover:text-brand-accent transition-colors">{cat}</span>
               </div>
             </div>
           </Link>

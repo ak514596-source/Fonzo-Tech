@@ -15,12 +15,14 @@ export function ProductCard({ product }: { product: Product }) {
 
   return (
     <article
-      className="group relative flex flex-col rounded-xl border border-card-border bg-card overflow-hidden hover-elevate transition-all"
+      className="group relative flex flex-col rounded-xl border border-card-border bg-card overflow-hidden hover-elevate transition-all hover:border-brand-accent/40 hover:shadow-lg"
       data-testid={`card-product-${product.id}`}
     >
       <Link href={`/product/${product.id}`} data-testid={`link-product-${product.id}`}>
-        <div className="relative cursor-pointer">
-          <ProductVisual product={product} />
+        <div className="relative cursor-pointer overflow-hidden">
+          <div className="transition-transform duration-500 ease-out group-hover:scale-[1.04]">
+            <ProductVisual product={product} />
+          </div>
           <div className="absolute top-2 left-2 flex flex-col gap-1.5">
             {off !== null && (
               <Badge className="bg-brand-accent text-[hsl(var(--brand-accent-foreground))] border-transparent hover:bg-brand-accent" data-testid={`badge-discount-${product.id}`}>
